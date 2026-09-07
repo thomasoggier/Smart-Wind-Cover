@@ -1,0 +1,15 @@
+{
+  "python.analysis.extraPaths": [
+    "C:/Users/Thomas/AppData/Roaming/Python/Python314/site-packages",
+    "C:/Users/Thomas/AppData/Local/Programs/Python/Python314/Lib/site-packages"
+  ],
+  "python.analysis.packageIndexDepths": [
+    {
+      "name": "homeassistant",
+      "depth": 5,
+      "includeAllSymbols": true
+    }
+  ],
+  "python.analysis.autoSearchPaths": true,
+  "python.analysis.typeCheckingMode": "basic"
+}

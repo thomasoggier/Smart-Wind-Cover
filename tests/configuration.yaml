@@ -1,0 +1,51 @@
+default_config:
+
+# Permet de créer un store virtuel modifiable dans l'interface
+cover:
+  - platform: template
+    covers:
+      store_terrasse_physique:
+        friendly_name: "Store Terrasse (Physique)"
+        position_template: "{{ states('input_number.position_store_virtuel') }}"
+        open_cover:
+          service: input_number.set_value
+          target:
+            entity_id: input_number.position_store_virtuel
+          data:
+            value: 100
+        close_cover:
+          service: input_number.set_value
+          target:
+            entity_id: input_number.position_store_virtuel
+          data:
+            value: 0
+        set_cover_position:
+          service: input_number.set_value
+          target:
+            entity_id: input_number.position_store_virtuel
+          data:
+            value: "{{ position }}"
+
+# Curseurs pour simuler le vent et la position du store
+input_number:
+  vitesse_vent:
+    name: "Vitesse du vent (km/h)"
+    initial: 10
+    min: 0
+    max: 120
+    step: 1
+    unit_of_measurement: "km/h"
+
+  position_store_virtuel:
+    name: "Position physique store"
+    initial: 100
+    min: 0
+    max: 100
+    step: 1
+
+# Configuration de votre composant personnalisé
+smart_wind_cover:
+  - name: "Store Protege Vent"
+    cover_entity: cover.store_terrasse_physique
+    wind_sensor_entity: input_number.vitesse_vent
+    wind_threshold: 40
