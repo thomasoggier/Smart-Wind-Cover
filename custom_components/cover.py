@@ -13,16 +13,16 @@ from homeassistant.components.cover import (
 )
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.const import (
-    STATE_CLOSED,
-    STATE_OPEN,
+    EVENT_HOMEASSISTANT_STARTED,
     STATE_UNAVAILABLE,
     STATE_UNKNOWN,
 )
-from homeassistant.core import Event, HomeAssistant
+from homeassistant.core import Event, HomeAssistant, callback
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
 from homeassistant.helpers.event import (
     async_call_later,
     async_track_state_change_event,
+    async_track_time_interval,
 )
 import homeassistant.util.dt as dt_util
 
@@ -49,6 +49,7 @@ async def async_setup_entry(
     """Configuration de la plateforme cover."""
     cover_entity = WindProtectedCoverEntity(hass, entry)
 
+    # Stockage immédiat dans hass.data pour la plateforme sensor
     hass.data.setdefault(DOMAIN, {})[entry.entry_id]["cover_entity"] = cover_entity
 
     async_add_entities([cover_entity])
@@ -86,7 +87,9 @@ class WindProtectedCoverEntity(CoverEntity):
 
         self._attr_unique_id = f"{entry.entry_id}_cover"
         state = hass.states.get(self._physical_cover) if self._physical_cover else None
-        self._attr_name = f"Store Protégé ({state.name if state else self._physical_cover})"
+        
+        name_suffix = state.name if state and state.name else self._physical_cover
+        self._attr_name = f"Store Protégé ({name_suffix})"
 
         initial_position = 100
         if state and state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN):
@@ -97,10 +100,11 @@ class WindProtectedCoverEntity(CoverEntity):
         self._current_position: int | None = initial_position
         self._user_consigne: int = initial_position
         self._safety_limit: int = 0
-        self._target_position: int | None = initial_position  # Suivi de la cible en cours
+        self._target_position: int | None = initial_position
         self._is_manual_stopped = False
         self._last_trigger_times: dict[float, dt_util.datetime | None] = {}
-        self._unsub_timer = None
+        self._unsub_timer: Any = None
+        self._unsub_interval: Any = None
 
     @property
     def parsed_wind_rules(self) -> list[dict[str, float]]:
@@ -165,9 +169,8 @@ class WindProtectedCoverEntity(CoverEntity):
             "safety_active": self._safety_limit > 0,
         }
 
-    async def async_added_to_hass(self) -> None:
-        await super().async_added_to_hass()
-
+    async def _async_register_knx_group_addresses(self) -> None:
+        """Enregistre les adresses de groupe KNX auprès de l'intégration KNX."""
         gas_to_register = []
         if self._move_ga:
             gas_to_register.append(str(self._move_ga))
@@ -182,14 +185,44 @@ class WindProtectedCoverEntity(CoverEntity):
                     {"address": gas_to_register},
                     blocking=True,
                 )
-                _LOGGER.debug("[%s] GA KNX enregistrées avec succès : %s", self._attr_name, gas_to_register)
+                _LOGGER.debug("[%s] GA KNX enregistrées : %s", self._attr_name, gas_to_register)
             except Exception as err:
                 _LOGGER.error("[%s] Échec de l'enregistrement des GA KNX : %s", self._attr_name, err)
 
+    async def _async_check_and_reregister_knx(self, _now: dt_util.datetime | None = None) -> None:
+        """Vérifie la présence du service KNX et ré-enregistre les adresses de groupe."""
+        if self.hass.services.has_service("knx", "event_register"):
+            await self._async_register_knx_group_addresses()
+
+    async def async_added_to_hass(self) -> None:
+        await super().async_added_to_hass()
+
+        # Enregistrement initial auprès du service KNX
+        await self._async_register_knx_group_addresses()
+
+        # Ré-enregistrement périodique toutes les 30 secondes (pour parer aux rechargements dynamiques de KNX)
+        self._unsub_interval = async_track_time_interval(
+            self.hass,
+            self._async_check_and_reregister_knx,
+            timedelta(seconds=30),
+        )
+
+        # Écoute des télégrammes KNX
         self.async_on_remove(
             self.hass.bus.async_listen("knx_event", self._handle_knx_event)
         )
+
+        # Ré-enregistrement automatique des GA si Home Assistant redémarre
+        @callback
+        def _async_re_register_knx(event: Event) -> None:
+            _LOGGER.info("[%s] Détection du démarrage HA, ré-enregistrement des GA...", self._attr_name)
+            self.hass.async_create_task(self._async_register_knx_group_addresses())
+
+        self.async_on_remove(
+            self.hass.bus.async_listen(EVENT_HOMEASSISTANT_STARTED, _async_re_register_knx)
+        )
         
+        # Écoute des changements d'état du capteur de vent
         if self._wind_sensor_entity:
             self.async_on_remove(
                 async_track_state_change_event(
@@ -199,6 +232,7 @@ class WindProtectedCoverEntity(CoverEntity):
                 )
             )
 
+        # Écoute du store physique
         if self._physical_cover:
             self.async_on_remove(
                 async_track_state_change_event(
@@ -210,11 +244,23 @@ class WindProtectedCoverEntity(CoverEntity):
 
         await self._async_apply_arbitration()
 
+    async def async_will_remove_from_hass(self) -> None:
+        """Nettoyage lors du retrait de l'entité."""
+        if self._unsub_timer:
+            self._unsub_timer()
+            self._unsub_timer = None
+
+        if self._unsub_interval:
+            self._unsub_interval()
+            self._unsub_interval = None
+
+        await super().async_will_remove_from_hass()
+
     async def _async_wind_sensor_changed(self, event: Event) -> None:
         await self._async_apply_arbitration()
 
     async def _handle_knx_event(self, event: Event) -> None:
-        """Handle knx event on Open/Close/Stop cover"""
+        """Gère les événements KNX pour l'ouverture, fermeture et stop."""
         telegram_data = event.data
         destination = str(telegram_data.get("destination", "")).strip()
         if destination not in (self._move_ga, self._stop_ga):
@@ -267,7 +313,6 @@ class WindProtectedCoverEntity(CoverEntity):
             return
 
         self._user_consigne = int(position)
-        self.async_write_ha_state()
         _LOGGER.info("Consigne utilisateur mise à jour: %s%%", self._user_consigne)
         await self._async_apply_arbitration()
 
@@ -279,6 +324,7 @@ class WindProtectedCoverEntity(CoverEntity):
         next_expiration: float | None = None
 
         wind_speed = self._get_wind_speed()
+        keys_to_delete = []
 
         for rule in self.parsed_wind_rules:
             seuil_vent = rule["vent"]
@@ -310,16 +356,20 @@ class WindProtectedCoverEntity(CoverEntity):
                                 "[%s] Accalmie validée -> Levée de la contrainte %s%%",
                                 self._attr_name, min_repli
                             )
-                            del self._last_trigger_times[min_repli]
+                            keys_to_delete.append(min_repli)
+
+        for key in keys_to_delete:
+            self._last_trigger_times.pop(key, None)
 
         if self._unsub_timer:
             self._unsub_timer()
             self._unsub_timer = None
 
         if next_expiration is not None and next_expiration > 0:
-            async def _scheduled_update(now_dt):
+            @callback
+            def _scheduled_update(now_dt: Any) -> None:
                 self._unsub_timer = None
-                await self._async_apply_arbitration()
+                self.hass.async_create_task(self._async_apply_arbitration())
 
             self._unsub_timer = async_call_later(
                 self.hass, next_expiration + 0.1, _scheduled_update
@@ -327,7 +377,7 @@ class WindProtectedCoverEntity(CoverEntity):
 
         return max(active_limits)
 
-    def _get_wind_speed(self):
+    def _get_wind_speed(self) -> float:
         try:
             wind_state = self.hass.states.get(self._wind_sensor_entity)
             return float(wind_state.state) if wind_state and wind_state.state not in (STATE_UNAVAILABLE, STATE_UNKNOWN) else 0.0
@@ -340,12 +390,9 @@ class WindProtectedCoverEntity(CoverEntity):
         max_allowed = self._get_max_allowed_position()
         self._safety_limit = int(max_allowed)
         target_position = max(self._user_consigne, self._safety_limit)
-        self.async_write_ha_state()
 
-        # Ne re-transmet l'ordre que si la CIBLE a changé
         if self._target_position != target_position:
             self._target_position = target_position
-            self.async_write_ha_state()
 
             _LOGGER.debug(
                 "Envoi ordre -> Consigne User: %s, Sécurité Vent: %s%% (%skm/h) => Cible appliquée: %s%% sur %s",
@@ -355,7 +402,6 @@ class WindProtectedCoverEntity(CoverEntity):
                 self._target_position,
                 self._physical_cover or self._move_ga,
             )
-            self.async_write_ha_state()
 
             if self._physical_cover:
                 await self.hass.services.async_call(
@@ -367,6 +413,7 @@ class WindProtectedCoverEntity(CoverEntity):
                     },
                     blocking=False,
                 )
+
         self.async_write_ha_state()
 
     async def _async_physical_cover_changed(self, event: Event) -> None:
@@ -380,10 +427,8 @@ class WindProtectedCoverEntity(CoverEntity):
             self._current_position = int(pos)
             _LOGGER.debug("Retour d'état physique (position) : %s%%", self._current_position)
 
-
         if self._is_manual_stopped and self._current_position is not None:
             self._user_consigne = self._current_position
-            self.async_write_ha_state()
             _LOGGER.info(
                 "Consigne utilisateur mise à jour par bouton stop: %s%%",
                 self._user_consigne
